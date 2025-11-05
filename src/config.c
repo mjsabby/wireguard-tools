@@ -38,40 +38,28 @@ static const char *get_value(const char *line, const char *key)
 
 static inline bool parse_port(uint16_t *port, uint32_t *flags, const char *value)
 {
-	int ret;
-	struct addrinfo *resolved;
-	struct addrinfo hints = {
-		.ai_family = AF_UNSPEC,
-		.ai_socktype = SOCK_DGRAM,
-		.ai_protocol = IPPROTO_UDP,
-		.ai_flags = AI_PASSIVE
-	};
+	unsigned long ret;
+	char *end;
 
 	if (!strlen(value)) {
 		fprintf(stderr, "Unable to parse empty port\n");
 		return false;
 	}
 
-	ret = getaddrinfo(NULL, value, &hints, &resolved);
-	if (ret) {
-		fprintf(stderr, "%s: `%s'\n", ret == EAI_SYSTEM ? strerror(errno) : gai_strerror(ret), value);
+	if (!char_is_digit(value[0])) {
+		fprintf(stderr, "Unable to parse port (must be numeric): `%s'\n", value);
 		return false;
 	}
 
-	ret = -1;
-	if (resolved->ai_family == AF_INET && resolved->ai_addrlen == sizeof(struct sockaddr_in)) {
-		*port = ntohs(((struct sockaddr_in *)resolved->ai_addr)->sin_port);
-		ret = 0;
-	} else if (resolved->ai_family == AF_INET6 && resolved->ai_addrlen == sizeof(struct sockaddr_in6)) {
-		*port = ntohs(((struct sockaddr_in6 *)resolved->ai_addr)->sin6_port);
-		ret = 0;
-	} else
-		fprintf(stderr, "Neither IPv4 nor IPv6 address found: `%s'\n", value);
+	ret = strtoul(value, &end, 10);
+	if (*end || ret > 65535) {
+		fprintf(stderr, "Unable to parse port (must be 0-65535): `%s'\n", value);
+		return false;
+	}
 
-	freeaddrinfo(resolved);
-	if (!ret)
-		*flags |= WGDEVICE_HAS_LISTEN_PORT;
-	return ret == 0;
+	*port = (uint16_t)ret;
+	*flags |= WGDEVICE_HAS_LISTEN_PORT;
+	return true;
 }
 
 static inline bool parse_fwmark(uint32_t *fwmark, uint32_t *flags, const char *value)
@@ -195,14 +183,10 @@ static inline int parse_dns_retries(void)
 static inline bool parse_endpoint(struct sockaddr *endpoint, const char *value)
 {
 	char *mutable = strdup(value);
-	char *begin, *end;
-	int ret, retries = parse_dns_retries();
-	struct addrinfo *resolved;
-	struct addrinfo hints = {
-		.ai_family = AF_UNSPEC,
-		.ai_socktype = SOCK_DGRAM,
-		.ai_protocol = IPPROTO_UDP
-	};
+	char *begin, *end, *port_str;
+	unsigned long port_num;
+	int ret;
+
 	if (!mutable) {
 		perror("strdup");
 		return false;
@@ -212,7 +196,10 @@ static inline bool parse_endpoint(struct sockaddr *endpoint, const char *value)
 		fprintf(stderr, "Unable to parse empty endpoint\n");
 		return false;
 	}
+
+	/* Parse endpoint format: either [IPv6]:port or IPv4:port */
 	if (mutable[0] == '[') {
+		/* IPv6 format: [2001:db8::1]:51820 */
 		begin = &mutable[1];
 		end = strchr(mutable, ']');
 		if (!end) {
@@ -226,7 +213,18 @@ static inline bool parse_endpoint(struct sockaddr *endpoint, const char *value)
 			fprintf(stderr, "Unable to find port of endpoint: `%s'\n", value);
 			return false;
 		}
+		port_str = end;
+
+		/* Parse IPv6 address */
+		ret = inet_pton(AF_INET6, begin, &((struct sockaddr_in6 *)endpoint)->sin6_addr);
+		if (ret != 1) {
+			free(mutable);
+			fprintf(stderr, "Unable to parse IPv6 address (hostnames not supported in static builds): `%s'\n", value);
+			return false;
+		}
+		((struct sockaddr_in6 *)endpoint)->sin6_family = AF_INET6;
 	} else {
+		/* IPv4 format: 192.168.1.1:51820 */
 		begin = mutable;
 		end = strrchr(mutable, ':');
 		if (!end || !*(end + 1)) {
@@ -235,46 +233,38 @@ static inline bool parse_endpoint(struct sockaddr *endpoint, const char *value)
 			return false;
 		}
 		*end++ = '\0';
-	}
+		port_str = end;
 
-	#define min(a, b) ((a) < (b) ? (a) : (b))
-	for (unsigned int timeout = 1000000;; timeout = min(20000000, timeout * 6 / 5)) {
-		ret = getaddrinfo(begin, end, &hints, &resolved);
-		if (!ret)
-			break;
-		/* The set of return codes that are "permanent failures". All other possibilities are potentially transient.
-		 *
-		 * This is according to https://sourceware.org/glibc/wiki/NameResolver which states:
-		 *	"From the perspective of the application that calls getaddrinfo() it perhaps
-		 *	 doesn't matter that much since EAI_FAIL, EAI_NONAME and EAI_NODATA are all
-		 *	 permanent failure codes and the causes are all permanent failures in the
-		 *	 sense that there is no point in retrying later."
-		 *
-		 * So this is what we do, except FreeBSD removed EAI_NODATA some time ago, so that's conditional.
-		 */
-		if (ret == EAI_NONAME || ret == EAI_FAIL ||
-			#ifdef EAI_NODATA
-				ret == EAI_NODATA ||
-			#endif
-				(retries >= 0 && !retries--)) {
+		/* Parse IPv4 address */
+		ret = inet_pton(AF_INET, begin, &((struct sockaddr_in *)endpoint)->sin_addr);
+		if (ret != 1) {
 			free(mutable);
-			fprintf(stderr, "%s: `%s'\n", ret == EAI_SYSTEM ? strerror(errno) : gai_strerror(ret), value);
+			fprintf(stderr, "Unable to parse IPv4 address (hostnames not supported in static builds): `%s'\n", value);
 			return false;
 		}
-		fprintf(stderr, "%s: `%s'. Trying again in %.2f seconds...\n", ret == EAI_SYSTEM ? strerror(errno) : gai_strerror(ret), value, timeout / 1000000.0);
-		usleep(timeout);
+		((struct sockaddr_in *)endpoint)->sin_family = AF_INET;
 	}
 
-	if ((resolved->ai_family == AF_INET && resolved->ai_addrlen == sizeof(struct sockaddr_in)) ||
-	    (resolved->ai_family == AF_INET6 && resolved->ai_addrlen == sizeof(struct sockaddr_in6)))
-		memcpy(endpoint, resolved->ai_addr, resolved->ai_addrlen);
-	else {
-		freeaddrinfo(resolved);
+	/* Parse port number */
+	if (!char_is_digit(port_str[0])) {
 		free(mutable);
-		fprintf(stderr, "Neither IPv4 nor IPv6 address found: `%s'\n", value);
+		fprintf(stderr, "Unable to parse port (must be numeric): `%s'\n", value);
 		return false;
 	}
-	freeaddrinfo(resolved);
+
+	port_num = strtoul(port_str, &end, 10);
+	if (*end || port_num > 65535) {
+		free(mutable);
+		fprintf(stderr, "Unable to parse port (must be 0-65535): `%s'\n", value);
+		return false;
+	}
+
+	/* Set port in the appropriate structure */
+	if (((struct sockaddr *)endpoint)->sa_family == AF_INET6)
+		((struct sockaddr_in6 *)endpoint)->sin6_port = htons((uint16_t)port_num);
+	else
+		((struct sockaddr_in *)endpoint)->sin_port = htons((uint16_t)port_num);
+
 	free(mutable);
 	return true;
 }

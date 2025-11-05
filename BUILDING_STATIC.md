@@ -46,10 +46,13 @@ make CC=musl-gcc STATIC=yes
 
 ## Notes
 
-- The static glibc build may show a warning about `getaddrinfo` requiring runtime shared libraries. This is expected and the binary will still work correctly.
-- Static binaries are significantly larger than dynamic ones (typically ~1.2MB vs ~100KB)
+- Static binaries are significantly larger than dynamic ones (typically ~1.1MB vs ~100KB)
 - Static binaries are portable across different Linux distributions without dependency concerns
 - The `STATIC` option works for Linux builds; other platforms may have different requirements
+- **DNS/hostname resolution has been removed** - all endpoints and ports must be specified as:
+  - Numeric ports only (e.g., `51820`, not service names like `http`)
+  - IP addresses only (e.g., `192.168.1.1:51820` or `[2001:db8::1]:51820`, not hostnames like `vpn.example.com:51820`)
+  - This is ideal for embedded/minimal environments without DNS infrastructure
 
 ## Build Options Summary
 
