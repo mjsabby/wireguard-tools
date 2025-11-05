@@ -37,9 +37,8 @@ wireguard-init: wireguard-init.c $(WG_OBJS)
 	@echo "Build successful!"
 
 # Static build (recommended)
-wireguard-init-static: wireguard-init.c
+wireguard-init-static: wireguard-init.c $(WG_OBJS)
 	@echo "Building static wireguard-init..."
-	$(MAKE) -C $(WG_SRC_DIR) STATIC=yes config.o encoding.o ipc.o curve25519.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $< \
 		$(WG_SRC_DIR)/config.o \
 		$(WG_SRC_DIR)/encoding.o \

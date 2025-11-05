@@ -38,28 +38,40 @@ static const char *get_value(const char *line, const char *key)
 
 static inline bool parse_port(uint16_t *port, uint32_t *flags, const char *value)
 {
-	unsigned long ret;
-	char *end;
+	int ret;
+	struct addrinfo *resolved;
+	struct addrinfo hints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_DGRAM,
+		.ai_protocol = IPPROTO_UDP,
+		.ai_flags = AI_PASSIVE
+	};
 
 	if (!strlen(value)) {
 		fprintf(stderr, "Unable to parse empty port\n");
 		return false;
 	}
 
-	if (!char_is_digit(value[0])) {
-		fprintf(stderr, "Unable to parse port (must be numeric): `%s'\n", value);
+	ret = getaddrinfo(NULL, value, &hints, &resolved);
+	if (ret) {
+		fprintf(stderr, "%s: `%s'\n", ret == EAI_SYSTEM ? strerror(errno) : gai_strerror(ret), value);
 		return false;
 	}
 
-	ret = strtoul(value, &end, 10);
-	if (*end || ret > 65535) {
-		fprintf(stderr, "Unable to parse port (must be 0-65535): `%s'\n", value);
-		return false;
-	}
+	ret = -1;
+	if (resolved->ai_family == AF_INET && resolved->ai_addrlen == sizeof(struct sockaddr_in)) {
+		*port = ntohs(((struct sockaddr_in *)resolved->ai_addr)->sin_port);
+		ret = 0;
+	} else if (resolved->ai_family == AF_INET6 && resolved->ai_addrlen == sizeof(struct sockaddr_in6)) {
+		*port = ntohs(((struct sockaddr_in6 *)resolved->ai_addr)->sin6_port);
+		ret = 0;
+	} else
+		fprintf(stderr, "Neither IPv4 nor IPv6 address found: `%s'\n", value);
 
-	*port = (uint16_t)ret;
-	*flags |= WGDEVICE_HAS_LISTEN_PORT;
-	return true;
+	freeaddrinfo(resolved);
+	if (!ret)
+		*flags |= WGDEVICE_HAS_LISTEN_PORT;
+	return ret == 0;
 }
 
 static inline bool parse_fwmark(uint32_t *fwmark, uint32_t *flags, const char *value)
