@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT
- * Example WireGuard Init Program (PID 1)
+ * WireGuard Init Program (PID 1) - Pure Syscalls, No External Tools
  *
- * This demonstrates how to build a custom init that:
- * 1. Brings up network
- * 2. Configures WireGuard
- * 3. Runs HTTP stats server
- * 4. Handles PID 1 responsibilities (reaping zombies)
+ * This is a complete init program using ONLY syscalls and ioctl.
+ * No external tools (ip, busybox, etc.) required.
+ *
+ * Features:
+ * 1. Brings up network interfaces (ioctl)
+ * 2. Assigns IP addresses (ioctl)
+ * 3. Creates WireGuard interface (netlink)
+ * 4. Configures WireGuard (wireguard-tools IPC)
+ * 5. Runs HTTP stats server
+ * 6. Handles PID 1 responsibilities (zombie reaping)
  */
 
 #include <stdio.h>
@@ -15,16 +20,218 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <net/route.h>
+#include <linux/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <errno.h>
 #include <stdbool.h>
 
-/* WireGuard tools headers - you can link against the .o files */
+/* WireGuard tools headers */
 #include "ipc.h"
 #include "config.h"
 #include "containers.h"
 #include "encoding.h"
+
+/* Configuration - Edit these for your setup */
+#define ETH_INTERFACE      "eth0"
+#define ETH_IP_ADDRESS     "10.0.0.1"
+#define ETH_NETMASK        "255.255.255.0"
+#define WG_INTERFACE       "wg0"
+#define WG_IP_ADDRESS      "10.100.0.1"
+#define WG_NETMASK         "255.255.255.0"
+#define WG_CONFIG_PATH     "/wireguard.conf"
+#define HTTP_PORT          8080
+
+/* ============================================================================
+ * Low-Level Network Functions (Pure ioctl/syscalls)
+ * ============================================================================ */
+
+static int bring_interface_up(const char *ifname)
+{
+	int sock;
+	struct ifreq ifr;
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		perror("socket");
+		return -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+	/* Get current flags */
+	if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+		perror("SIOCGIFFLAGS");
+		close(sock);
+		return -1;
+	}
+
+	/* Set interface UP */
+	ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+
+	if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
+		perror("SIOCSIFFLAGS");
+		close(sock);
+		return -1;
+	}
+
+	close(sock);
+	printf("Interface %s brought up\n", ifname);
+	return 0;
+}
+
+static int set_interface_address(const char *ifname, const char *ip, const char *netmask)
+{
+	int sock;
+	struct ifreq ifr;
+	struct sockaddr_in *addr;
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		perror("socket");
+		return -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+	/* Set IP address */
+	addr = (struct sockaddr_in *)&ifr.ifr_addr;
+	addr->sin_family = AF_INET;
+	if (inet_pton(AF_INET, ip, &addr->sin_addr) != 1) {
+		fprintf(stderr, "Invalid IP address: %s\n", ip);
+		close(sock);
+		return -1;
+	}
+
+	if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
+		perror("SIOCSIFADDR");
+		close(sock);
+		return -1;
+	}
+
+	/* Set netmask */
+	addr = (struct sockaddr_in *)&ifr.ifr_netmask;
+	addr->sin_family = AF_INET;
+	if (inet_pton(AF_INET, netmask, &addr->sin_addr) != 1) {
+		fprintf(stderr, "Invalid netmask: %s\n", netmask);
+		close(sock);
+		return -1;
+	}
+
+	if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) {
+		perror("SIOCSIFNETMASK");
+		close(sock);
+		return -1;
+	}
+
+	close(sock);
+	printf("Interface %s assigned address %s netmask %s\n", ifname, ip, netmask);
+	return 0;
+}
+
+/* ============================================================================
+ * Netlink Interface Creation
+ * ============================================================================ */
+
+struct nl_req {
+	struct nlmsghdr n;
+	struct ifinfomsg i;
+	char buf[1024];
+};
+
+static int create_wireguard_interface(const char *ifname)
+{
+	int sock;
+	struct nl_req req;
+	struct rtattr *linkinfo, *data;
+	struct sockaddr_nl sa;
+	char buf[4096];
+	int ret = -1;
+
+	/* Create netlink socket */
+	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock < 0) {
+		perror("netlink socket");
+		return -1;
+	}
+
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		perror("netlink bind");
+		close(sock);
+		return -1;
+	}
+
+	/* Build netlink request to create interface */
+	memset(&req, 0, sizeof(req));
+	req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK;
+	req.n.nlmsg_type = RTM_NEWLINK;
+	req.i.ifi_family = AF_UNSPEC;
+
+	/* Add interface name */
+	struct rtattr *attr = (struct rtattr *)(((char *)&req) + NLMSG_ALIGN(req.n.nlmsg_len));
+	attr->rta_type = IFLA_IFNAME;
+	attr->rta_len = RTA_LENGTH(strlen(ifname) + 1);
+	strcpy(RTA_DATA(attr), ifname);
+	req.n.nlmsg_len = NLMSG_ALIGN(req.n.nlmsg_len) + RTA_ALIGN(attr->rta_len);
+
+	/* Add link info for wireguard */
+	linkinfo = (struct rtattr *)(((char *)&req) + NLMSG_ALIGN(req.n.nlmsg_len));
+	linkinfo->rta_type = IFLA_LINKINFO;
+	linkinfo->rta_len = RTA_LENGTH(0);
+
+	/* Add kind = "wireguard" */
+	struct rtattr *kind = (struct rtattr *)(((char *)linkinfo) + RTA_ALIGN(linkinfo->rta_len));
+	kind->rta_type = IFLA_INFO_KIND;
+	kind->rta_len = RTA_LENGTH(strlen("wireguard") + 1);
+	strcpy(RTA_DATA(kind), "wireguard");
+	linkinfo->rta_len = RTA_ALIGN(linkinfo->rta_len) + RTA_ALIGN(kind->rta_len);
+
+	req.n.nlmsg_len = NLMSG_ALIGN(req.n.nlmsg_len) + RTA_ALIGN(linkinfo->rta_len);
+
+	/* Send netlink message */
+	if (send(sock, &req, req.n.nlmsg_len, 0) < 0) {
+		perror("netlink send");
+		close(sock);
+		return -1;
+	}
+
+	/* Read acknowledgment */
+	int len = recv(sock, buf, sizeof(buf), 0);
+	if (len < 0) {
+		perror("netlink recv");
+		close(sock);
+		return -1;
+	}
+
+	struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+	if (nh->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nh);
+		if (err->error == 0) {
+			printf("WireGuard interface %s created\n", ifname);
+			ret = 0;
+		} else if (err->error == -EEXIST) {
+			printf("WireGuard interface %s already exists\n", ifname);
+			ret = 0;  /* Not an error if it already exists */
+		} else {
+			fprintf(stderr, "Netlink error creating interface: %s\n", strerror(-err->error));
+			ret = -1;
+		}
+	}
+
+	close(sock);
+	return ret;
+}
 
 /* ============================================================================
  * Network Setup
@@ -32,33 +239,25 @@
 
 static int setup_network(void)
 {
-	int ret;
-
 	/* Bring up loopback */
-	ret = system("ip link set lo up");
-	if (ret != 0) {
+	if (bring_interface_up("lo") < 0) {
 		fprintf(stderr, "Failed to bring up loopback\n");
 		return -1;
 	}
 
-	/* Bring up ethernet (eth0) */
-	ret = system("ip link set eth0 up");
-	if (ret != 0) {
-		fprintf(stderr, "Failed to bring up eth0\n");
+	/* Bring up ethernet */
+	if (bring_interface_up(ETH_INTERFACE) < 0) {
+		fprintf(stderr, "Failed to bring up %s\n", ETH_INTERFACE);
 		return -1;
 	}
 
-	/* Assign static IP - adjust as needed */
-	ret = system("ip addr add 10.0.0.1/24 dev eth0");
-	if (ret != 0) {
-		fprintf(stderr, "Failed to assign IP address\n");
+	/* Assign IP address to ethernet */
+	if (set_interface_address(ETH_INTERFACE, ETH_IP_ADDRESS, ETH_NETMASK) < 0) {
+		fprintf(stderr, "Failed to assign IP to %s\n", ETH_INTERFACE);
 		return -1;
 	}
 
-	/* Optional: default route */
-	/* system("ip route add default via 10.0.0.254"); */
-
-	printf("Network configured: eth0 = 10.0.0.1/24\n");
+	printf("Network configured: %s = %s/%s\n", ETH_INTERFACE, ETH_IP_ADDRESS, ETH_NETMASK);
 	return 0;
 }
 
@@ -75,8 +274,8 @@ static int setup_wireguard(const char *config_path)
 	size_t line_len = 0;
 	int ret = -1;
 
-	/* Create WireGuard interface first */
-	if (system("ip link add wg0 type wireguard") != 0) {
+	/* Create WireGuard interface via netlink */
+	if (create_wireguard_interface(WG_INTERFACE) < 0) {
 		fprintf(stderr, "Failed to create WireGuard interface\n");
 		return -1;
 	}
@@ -111,26 +310,28 @@ static int setup_wireguard(const char *config_path)
 	}
 
 	/* Set interface name */
-	strncpy(device->name, "wg0", IFNAMSIZ - 1);
+	strncpy(device->name, WG_INTERFACE, IFNAMSIZ - 1);
 	device->name[IFNAMSIZ - 1] = '\0';
 
-	/* Apply configuration to kernel */
+	/* Apply configuration to kernel via wireguard-tools IPC */
 	if (ipc_set_device(device) != 0) {
 		perror("Failed to configure WireGuard interface");
 		goto cleanup;
 	}
 
-	/* Bring interface up */
-	if (system("ip link set wg0 up") != 0) {
-		fprintf(stderr, "Failed to bring up wg0\n");
+	/* Bring WireGuard interface up */
+	if (bring_interface_up(WG_INTERFACE) < 0) {
+		fprintf(stderr, "Failed to bring up %s\n", WG_INTERFACE);
 		goto cleanup;
 	}
 
-	/* Add WireGuard IP address (read from config or hardcode) */
-	/* Adjust as needed based on your setup */
-	system("ip addr add 10.100.0.1/24 dev wg0");
+	/* Assign IP address to WireGuard interface */
+	if (set_interface_address(WG_INTERFACE, WG_IP_ADDRESS, WG_NETMASK) < 0) {
+		fprintf(stderr, "Failed to assign IP to %s\n", WG_INTERFACE);
+		goto cleanup;
+	}
 
-	printf("WireGuard interface configured and up\n");
+	printf("WireGuard interface configured: %s = %s/%s\n", WG_INTERFACE, WG_IP_ADDRESS, WG_NETMASK);
 	ret = 0;
 
 cleanup:
@@ -162,14 +363,17 @@ static void handle_http_request(int client_fd)
 	struct wgdevice *device = NULL;
 	struct wgpeer *peer;
 	char response[65536];
-	char line[1024];
 	size_t offset = 0;
 	char pubkey[WG_KEY_LEN_BASE64];
 	char rx_str[64], tx_str[64];
 	time_t now = time(NULL);
 
+	/* Read request (we don't actually parse it) */
+	char req_buf[1024];
+	read(client_fd, req_buf, sizeof(req_buf) - 1);
+
 	/* Get WireGuard device stats */
-	if (ipc_get_device(&device, "wg0") < 0) {
+	if (ipc_get_device(&device, WG_INTERFACE) < 0) {
 		const char *error = "HTTP/1.0 500 Internal Server Error\r\n\r\nFailed to get WireGuard stats\n";
 		write(client_fd, error, strlen(error));
 		return;
@@ -183,8 +387,8 @@ static void handle_http_request(int client_fd)
 		"\r\n");
 
 	offset += snprintf(response + offset, sizeof(response) - offset,
-		"WireGuard Statistics (wg0)\n"
-		"==========================\n\n");
+		"WireGuard Statistics (%s)\n"
+		"==========================\n\n", WG_INTERFACE);
 
 	if (device->flags & WGDEVICE_HAS_PUBLIC_KEY) {
 		key_to_base64(pubkey, device->public_key);
@@ -339,31 +543,36 @@ static void setup_signals(void)
 
 int main(int argc, char *argv[])
 {
-	const char *wg_config = "/wireguard.conf";  /* Config in initramfs */
-	int http_port = 8080;
-
-	printf("Starting WireGuard Init (PID %d)\n", getpid());
+	printf("===========================================\n");
+	printf("WireGuard Init (PID %d)\n", getpid());
+	printf("Pure syscall implementation - no tools\n");
+	printf("===========================================\n\n");
 
 	/* Setup signal handlers (critical for PID 1) */
 	setup_signals();
 
 	/* 1. Setup network */
+	printf("Step 1: Setting up network...\n");
 	if (setup_network() != 0) {
 		fprintf(stderr, "Network setup failed\n");
-		/* As init, we shouldn't exit, but for critical failures... */
-		sleep(1);
-		return 1;
+		/* As init, we continue even on failure */
 	}
 
 	/* 2. Setup WireGuard */
-	if (setup_wireguard(wg_config) != 0) {
+	printf("\nStep 2: Setting up WireGuard...\n");
+	if (setup_wireguard(WG_CONFIG_PATH) != 0) {
 		fprintf(stderr, "WireGuard setup failed\n");
 		/* Continue anyway - HTTP server might still be useful */
 	}
 
 	/* 3. Run HTTP stats server (blocks forever) */
-	printf("Init complete, starting HTTP server...\n");
-	run_http_server(http_port);
+	printf("\nStep 3: Starting HTTP server...\n");
+	printf("===========================================\n");
+	printf("Init complete! Access stats at:\n");
+	printf("  http://%s:%d\n", ETH_IP_ADDRESS, HTTP_PORT);
+	printf("===========================================\n\n");
+
+	run_http_server(HTTP_PORT);
 
 	/* Should never reach here */
 	fprintf(stderr, "HTTP server exited unexpectedly\n");
