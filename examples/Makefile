@@ -22,9 +22,12 @@ WG_OBJS = \
 	$(WG_SRC_DIR)/ipc.o \
 	$(WG_SRC_DIR)/curve25519.o
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: wireguard-init
+
+# Test programs
+test: test-netlink-create
 
 # Build wireguard-tools objects first
 $(WG_SRC_DIR)/%.o: $(WG_SRC_DIR)/%.c
@@ -52,5 +55,16 @@ wireguard-init-static: wireguard-init.c $(WG_OBJS)
 	@ldd $@ 2>&1 | head -1
 	@ls -lh $@
 
+# Netlink test program (standalone, no dependencies)
+test-netlink-create: test-netlink-create.c
+	@echo "Building netlink test program..."
+	$(CC) -O2 -Wall -Wextra -o $@ $<
+	@echo "Build successful!"
+	@echo ""
+	@echo "To run the test (as root):"
+	@echo "  sudo ./test-netlink-create"
+	@echo ""
+	@echo "See TEST-NETLINK.md for details."
+
 clean:
-	rm -f wireguard-init wireguard-init-static *.o
+	rm -f wireguard-init wireguard-init-static test-netlink-create *.o

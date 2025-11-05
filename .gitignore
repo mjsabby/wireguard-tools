@@ -17,3 +17,4 @@ src/wg.exe
 maint/
 examples/wireguard-init
 examples/wireguard-init-static
+examples/test-netlink-create
