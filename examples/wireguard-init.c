@@ -175,10 +175,13 @@ static int create_wireguard_interface(const char *ifname)
 {
 	int sock;
 	struct nl_req req;
-	struct rtattr *linkinfo, *data;
+	struct rtattr *linkinfo, *attr, *kind;
 	struct sockaddr_nl sa;
 	char buf[4096];
 	int ret = -1;
+	int len;
+	struct nlmsghdr *nh;
+	struct nlmsgerr *err;
 
 	/* Create netlink socket */
 	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -204,7 +207,7 @@ static int create_wireguard_interface(const char *ifname)
 	req.i.ifi_family = AF_UNSPEC;
 
 	/* Add interface name */
-	struct rtattr *attr = (struct rtattr *)(((char *)&req) + NLMSG_ALIGN(req.n.nlmsg_len));
+	attr = (struct rtattr *)(((char *)&req) + NLMSG_ALIGN(req.n.nlmsg_len));
 	attr->rta_type = IFLA_IFNAME;
 	attr->rta_len = RTA_LENGTH(strlen(ifname) + 1);
 	strcpy(RTA_DATA(attr), ifname);
@@ -216,7 +219,7 @@ static int create_wireguard_interface(const char *ifname)
 	linkinfo->rta_len = RTA_LENGTH(0);
 
 	/* Add kind = "wireguard" */
-	struct rtattr *kind = (struct rtattr *)(((char *)linkinfo) + RTA_ALIGN(linkinfo->rta_len));
+	kind = (struct rtattr *)(((char *)linkinfo) + RTA_ALIGN(linkinfo->rta_len));
 	kind->rta_type = IFLA_INFO_KIND;
 	kind->rta_len = RTA_LENGTH(strlen("wireguard") + 1);
 	strcpy(RTA_DATA(kind), "wireguard");
@@ -232,16 +235,16 @@ static int create_wireguard_interface(const char *ifname)
 	}
 
 	/* Read acknowledgment */
-	int len = recv(sock, buf, sizeof(buf), 0);
+	len = recv(sock, buf, sizeof(buf), 0);
 	if (len < 0) {
 		perror("netlink recv");
 		close(sock);
 		return -1;
 	}
 
-	struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+	nh = (struct nlmsghdr *)buf;
 	if (nh->nlmsg_type == NLMSG_ERROR) {
-		struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nh);
+		err = (struct nlmsgerr *)NLMSG_DATA(nh);
 		if (err->error == 0) {
 			printf("WireGuard interface %s created\n", ifname);
 			ret = 0;
@@ -399,16 +402,28 @@ static void handle_http_request(int client_fd)
 	size_t offset = 0;
 	char pubkey[WG_KEY_LEN_BASE64];
 	char rx_str[64], tx_str[64];
-	time_t now = time(NULL);
+	time_t now;
+	char req_buf[1024];
+	ssize_t bytes_read;
+	ssize_t bytes_written;
+	const char *error;
+
+	now = time(NULL);
 
 	/* Read request (we don't actually parse it) */
-	char req_buf[1024];
-	read(client_fd, req_buf, sizeof(req_buf) - 1);
+	bytes_read = read(client_fd, req_buf, sizeof(req_buf) - 1);
+	if (bytes_read < 0) {
+		perror("read request");
+		return;
+	}
 
 	/* Get WireGuard device stats */
 	if (ipc_get_device(&device, WG_INTERFACE) < 0) {
-		const char *error = "HTTP/1.0 500 Internal Server Error\r\n\r\nFailed to get WireGuard stats\n";
-		write(client_fd, error, strlen(error));
+		error = "HTTP/1.0 500 Internal Server Error\r\n\r\nFailed to get WireGuard stats\n";
+		bytes_written = write(client_fd, error, strlen(error));
+		if (bytes_written < 0) {
+			perror("write error response");
+		}
 		return;
 	}
 
@@ -480,7 +495,10 @@ static void handle_http_request(int client_fd)
 	}
 
 	/* Send response */
-	write(client_fd, response, offset);
+	bytes_written = write(client_fd, response, offset);
+	if (bytes_written < 0) {
+		perror("write response");
+	}
 
 	free_wgdevice(device);
 }
@@ -490,6 +508,7 @@ static int run_http_server(int port)
 	int server_fd, client_fd;
 	struct sockaddr_in addr;
 	socklen_t addr_len;
+	int opt;
 
 	/* Create socket */
 	server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -499,7 +518,7 @@ static int run_http_server(int port)
 	}
 
 	/* Allow reuse */
-	int opt = 1;
+	opt = 1;
 	setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
 	/* Bind */
