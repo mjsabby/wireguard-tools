@@ -46,10 +46,13 @@
 #define WG_NETMASK         "255.255.255.0"
 #define WG_CONFIG_PATH     "/wireguard.conf"
 #define HTTP_PORT          8080
+#define ENABLE_IP_FORWARD  1    /* Set to 0 if you don't need forwarding */
 
 /* ============================================================================
  * Low-Level Network Functions (Pure ioctl/syscalls)
  * ============================================================================ */
+
+#include <fcntl.h>
 
 static int bring_interface_up(const char *ifname)
 {
@@ -133,6 +136,28 @@ static int set_interface_address(const char *ifname, const char *ip, const char 
 
 	close(sock);
 	printf("Interface %s assigned address %s netmask %s\n", ifname, ip, netmask);
+	return 0;
+}
+
+static int enable_ip_forwarding(void)
+{
+	int fd;
+	const char *enable = "1\n";
+
+	fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY);
+	if (fd < 0) {
+		perror("open /proc/sys/net/ipv4/ip_forward");
+		return -1;
+	}
+
+	if (write(fd, enable, 2) != 2) {
+		perror("write ip_forward");
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
+	printf("IP forwarding enabled\n");
 	return 0;
 }
 
@@ -256,6 +281,14 @@ static int setup_network(void)
 		fprintf(stderr, "Failed to assign IP to %s\n", ETH_INTERFACE);
 		return -1;
 	}
+
+#if ENABLE_IP_FORWARD
+	/* Enable IP forwarding (needed if peers access LAN or internet) */
+	if (enable_ip_forwarding() < 0) {
+		fprintf(stderr, "Warning: Failed to enable IP forwarding\n");
+		/* Continue anyway */
+	}
+#endif
 
 	printf("Network configured: %s = %s/%s\n", ETH_INTERFACE, ETH_IP_ADDRESS, ETH_NETMASK);
 	return 0;
