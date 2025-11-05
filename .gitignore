@@ -15,3 +15,5 @@ src/wg.exe
 *.til
 *.pro.user
 maint/
+examples/wireguard-init
+examples/wireguard-init-static
