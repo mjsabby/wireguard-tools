@@ -206,15 +206,15 @@ static int userspace_get_device(struct wgdevice **out, const char *iface)
 				peer->flags |= WGPEER_HAS_PRESHARED_KEY;
 		} else if (peer && !strcmp(key, "endpoint")) {
 			char *begin, *end;
-			unsigned long port_num;
-			int parse_ret;
-
+			struct addrinfo *resolved;
+			struct addrinfo hints = {
+				.ai_family = AF_UNSPEC,
+				.ai_socktype = SOCK_DGRAM,
+				.ai_protocol = IPPROTO_UDP
+			};
 			if (!strlen(value))
 				break;
-
-			/* Parse endpoint format from kernel: either [IPv6]:port or IPv4:port */
 			if (value[0] == '[') {
-				/* IPv6 format */
 				begin = &value[1];
 				end = strchr(value, ']');
 				if (!end)
@@ -222,39 +222,25 @@ static int userspace_get_device(struct wgdevice **out, const char *iface)
 				*end++ = '\0';
 				if (*end++ != ':' || !*end)
 					break;
-
-				/* Parse IPv6 address */
-				parse_ret = inet_pton(AF_INET6, begin, &((struct sockaddr_in6 *)&peer->endpoint.addr)->sin6_addr);
-				if (parse_ret != 1)
-					break;
-				((struct sockaddr_in6 *)&peer->endpoint.addr)->sin6_family = AF_INET6;
 			} else {
-				/* IPv4 format */
 				begin = value;
 				end = strrchr(value, ':');
 				if (!end || !*(end + 1))
 					break;
 				*end++ = '\0';
-
-				/* Parse IPv4 address */
-				parse_ret = inet_pton(AF_INET, begin, &((struct sockaddr_in *)&peer->endpoint.addr)->sin_addr);
-				if (parse_ret != 1)
-					break;
-				((struct sockaddr_in *)&peer->endpoint.addr)->sin_family = AF_INET;
 			}
-
-			/* Parse port number */
-			if (!char_is_digit(end[0]))
+			if (getaddrinfo(begin, end, &hints, &resolved) != 0) {
+				ret = ENETUNREACH;
+				goto err;
+			}
+			if ((resolved->ai_family == AF_INET && resolved->ai_addrlen == sizeof(struct sockaddr_in)) ||
+			    (resolved->ai_family == AF_INET6 && resolved->ai_addrlen == sizeof(struct sockaddr_in6)))
+				memcpy(&peer->endpoint.addr, resolved->ai_addr, resolved->ai_addrlen);
+			else  {
+				freeaddrinfo(resolved);
 				break;
-			port_num = strtoul(end, &end, 10);
-			if (*end || port_num > 65535)
-				break;
-
-			/* Set port in the appropriate structure */
-			if (((struct sockaddr *)&peer->endpoint.addr)->sa_family == AF_INET6)
-				((struct sockaddr_in6 *)&peer->endpoint.addr)->sin6_port = htons((uint16_t)port_num);
-			else
-				((struct sockaddr_in *)&peer->endpoint.addr)->sin_port = htons((uint16_t)port_num);
+			}
+			freeaddrinfo(resolved);
 		} else if (peer && !strcmp(key, "persistent_keepalive_interval")) {
 			peer->persistent_keepalive_interval = NUM(0xffffU);
 			peer->flags |= WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL;

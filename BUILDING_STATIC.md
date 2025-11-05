@@ -46,13 +46,21 @@ make CC=musl-gcc STATIC=yes
 
 ## Notes
 
-- Static binaries are significantly larger than dynamic ones (typically ~1.1MB vs ~100KB)
+- Static binaries are significantly larger than dynamic ones (typically ~1.2MB vs ~100KB)
 - Static binaries are portable across different Linux distributions without dependency concerns
 - The `STATIC` option works for Linux builds; other platforms may have different requirements
-- **DNS/hostname resolution has been removed** - all endpoints and ports must be specified as:
-  - Numeric ports only (e.g., `51820`, not service names like `http`)
-  - IP addresses only (e.g., `192.168.1.1:51820` or `[2001:db8::1]:51820`, not hostnames like `vpn.example.com:51820`)
-  - This is ideal for embedded/minimal environments without DNS infrastructure
+- You may see a warning about `getaddrinfo` during static linking:
+  ```
+  warning: Using 'getaddrinfo' in statically linked applications requires at runtime
+  the shared libraries from the glibc version used for linking
+  ```
+  This warning appears because:
+  - `parse_port()` has been optimized to use `strtoul()` (no DNS for ports)
+  - `parse_endpoint()` still uses `getaddrinfo()` for hostname support
+  - **Server configs don't use Endpoint fields**, so this code path is never executed in server-only deployments
+  - The warning is harmless if you're running a WireGuard server
+- Hostnames in endpoints are supported (client configs can use `Endpoint = vpn.example.com:51820`)
+- Numeric ports are required for `ListenPort` (no service name lookup)
 
 ## Build Options Summary
 
